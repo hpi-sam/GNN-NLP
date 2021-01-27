@@ -31,6 +31,12 @@ from torch_geometric.utils import add_self_loops, degree
 
 
 class GCNWeightedConv(MessagePassing):
+    '''
+    This implementation of GCN layer follows the PyTorchGeometric guidelines,
+    but might not be as accurate.
+    GCNWeightedConvM follows the paper more precisely, which is what needed for now
+    in order to improve the understanding of the model.
+    '''
     def __init__(self, in_channels, out_channels):
         super(GCNWeightedConv, self).__init__(aggr='add')  # "Add" aggregation (Step 5).
         self.lin = torch.nn.Linear(in_channels, out_channels)
@@ -67,13 +73,20 @@ class GCNWeightedConv(MessagePassing):
 
 class GCNWeightedConvM(MessagePassing):
     def __init__(self, in_channels, out_channels):
-        super(GCNWeightedConvM, self).__init__(aggr='add')  # "Add" aggregation (Step 5).
+        super(GCNWeightedConvM, self).__init__(aggr='add')
         self.lin = torch.nn.Linear(in_channels, out_channels)
-        # self.left_lin = torch.nn.Linear(in_channels, out_channels)
-        # self.right_lin = torch.nn.Linear(in_channels, out_channels)
 
-    def forward(self, X, A_left_tilda, A_right_tilda):  # , left_deg, right_deg):
+    def forward(self, X, A_left_tilda, A_right_tilda):
+        '''
+        This implementation overwrites the propagate() method.
+        This way it is les efficient, but more clear and comparable to the paper.
+        Later, when paper is understood better, it could be re-written in a more efficient way.
 
+        :param X:
+        :param A_left_tilda:
+        :param A_right_tilda:
+        :return:
+        '''
         D_right = torch.diag_embed(A_right_tilda.sum(dim=1).pow(-0.5))
         D_left = torch.diag_embed(A_left_tilda.sum(dim=1).pow(-0.5))
 
@@ -97,6 +110,9 @@ class GCNWeightedConvM(MessagePassing):
 
 
 class DivGraphNet(torch.nn.Module):
+    '''
+    Implementation of DivGraphPointer from https://arxiv.org/abs/1905.07689
+    '''
 
     def __init__(self, encoder, decoder):
         super(DivGraphNet, self).__init__()
@@ -109,39 +125,30 @@ class DivGraphNet(torch.nn.Module):
 
     def forward(self, batch, labels):
 
-        # encoder_out.shape for one article = (n_words, 100)
         keyphrases = []
-        # encoder_out: (11, 100)
+        # Encoder
         encoder_out = self.encoder(batch)
-        # context_vector: (1, 100)
         context_vector = encoder_out.mean(axis=0)
         loss = 0
         nodes = torch.cat((encoder_out, torch.ones(1, encoder_out.size(1))), 0)
         coverage = torch.zeros(len(nodes), 1)
-        #hidden_dim = self.decoder.bi * self.decoder.rnn_layers
+        # Decoder
         for l in range(len(labels)):
 
             if l == 0:
-                # input_token: (1, 1, 100)
+                # First input token is always <BOS> (BegginingOfString)
                 input_token = torch.zeros((1, 1, self.decoder.embed_size))
-                # hidden: (1, 1, 300)
                 hidden = torch.tanh(self.h_W(context_vector)).unsqueeze(0).unsqueeze(0)
             else:
-                # ids: (1, ...)
-                # import pdb;pdb.set_trace()
                 ids = list(chain.from_iterable(keyphrases))
-                # kp: (100,)
                 kp = nodes[ids, :].mean(axis=0)
-                # context_vector*kp: (1, 100)
-                # cy: (100,)
+
                 cy = (context_vector * kp)
-                # input_token: (1, 1, 100)
                 input_token = self.y_W(cy).unsqueeze(0).unsqueeze(0)
-                # hidden: (1, 1, 300)
                 hidden = torch.tanh(self.h_W(cy)).unsqueeze(0).unsqueeze(0)
 
             keyphrases.append([])
-
+            # Passing each word through decoder in order to predict (point) the next one
             for i in range(len(labels[l])):
 
                 att_w, hidden, word_id = self.decoder(input_token,
@@ -168,7 +175,7 @@ class DivGraphNet(torch.nn.Module):
 
 
 class DivGraphEncoder(nn.Module):
-
+    '''DivGraphEncoder'''
     def __init__(self, input_dim, hidden_dim, num_convs):
         super(DivGraphEncoder, self).__init__()
 
@@ -180,7 +187,7 @@ class DivGraphEncoder(nn.Module):
             self.convs.append(GCNWeightedConvM(hidden_dim, hidden_dim))
 
     def forward(self, data_obj):
-
+        '''Passing the data with its matrices through the conv layer GCNWeightedConvM'''
         x, a_left, a_right = data_obj.x, data_obj.a_left, data_obj.a_right
 
         for i in range(len(self.convs)):
@@ -219,26 +226,24 @@ class DivGraphDecoder(torch.nn.Module):
         self.rnn_layers = rnn_layers
 
     def forward(self, word_input, word_hidden, nodes, coverage):
-        # word_input: (1, 1, 100)
-        # word_hidden: (num_directions*num_layers, 1, 100)
-        # nodes: (11, 100)
-        # coverage: (1, 11)
-        # rnn_word: (1, 1, 100)
-        # rnn_hidden: (1, 1, 300)
+        '''
+        DivGraphDecoder
+
+        :param word_input: a vector representation of one word (node) of shape (batch, 1, embed)
+        :param word_hidden: a context vector of shape (num_directions*num_layers, 1, hidden)
+        :param nodes: representation of all the nodes as came out of the encoder of shape (n_words, embed)
+        :param coverage: an array of size (1, n_words), shows how much each word has appeared in keywords so far
+        :return:
+        '''
+        # GRU
         rnn_word, rnn_hidden = self.rnn(word_input, word_hidden)
-        # rnn_word: (1, 300)
-        # rnn_hidden: (1, 300)
         rnn_word = rnn_word.squeeze(0)
         hidden = rnn_hidden.squeeze(0)
-
+        # Attention
         hidden = self.att_W_hidden(hidden).expand(len(nodes), self.hidden_size)
-        # term: (11, 300)
         term = hidden + self.att_W_input(nodes) + self.att_W_coverage(coverage)
-        # att_coef: (11,)
         att_coef = self.att_v(torch.tanh(term)).squeeze(1)
-        # norm_att: (11, )
         norm_att = F.softmax(att_coef, dim=0)
-        # next_word_id: scalar
         next_word_id = norm_att.argmax().item()
 
         return norm_att, rnn_hidden, next_word_id
