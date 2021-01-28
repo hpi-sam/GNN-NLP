@@ -109,7 +109,9 @@ def make_DataObject(row):
     vocab = vocab.split()
     vocab.append('<EOS>')
     Aleft_tilda, Aright_tilda, columns = make_matrices(vocab)
-    X = torch.tensor([ft_model.get_sentence_vector(w).tolist() for w in columns])
+    X = torch.tensor([ft_model.get_sentence_vector(w).tolist()
+                      for w in columns if w != '<EOS>'])
+    X = torch.cat((X, torch.ones(1, X.size(1))), 0)
     # print(columns)
     data = Data(x=X)
     data.a_left = Aleft_tilda

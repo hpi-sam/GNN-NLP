@@ -20,7 +20,6 @@ import torch_geometric.utils as pyg_utils
 
 from torch_geometric.datasets import TUDataset
 from torch_geometric.datasets import Planetoid
-from torch_geometric.data import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.data import InMemoryDataset
 from torch_geometric.data import Dataset
@@ -114,64 +113,76 @@ class DivGraphNet(torch.nn.Module):
     Implementation of DivGraphPointer from https://arxiv.org/abs/1905.07689
     '''
 
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder, tensorboard=True, max_kp=5):
         super(DivGraphNet, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.hsize = self.decoder.hidden_size
+        self.esize = self.decoder.embed_size
+        self.y_W = nn.Linear(self.esize, self.esize)
+        self.h_W = nn.Linear(self.esize, self.hsize)
+        self.tb = tensorboard
+        self.max_kp = max_kp
 
-        self.y_W = nn.Linear(self.decoder.embed_size, self.decoder.embed_size)
-        self.h_W = nn.Linear(self.decoder.embed_size, self.decoder.hidden_size)
-        self.loss = nn.CrossEntropyLoss()
+    def forward(self, batch):
 
-    def forward(self, batch, labels):
-
+        batch_size = batch.x.size(0) if len(batch.x.shape) == 3 else 1
         keyphrases = []
         # Encoder
         encoder_out = self.encoder(batch)
-        context_vector = encoder_out.mean(axis=0)
-        loss = 0
-        nodes = torch.cat((encoder_out, torch.ones(1, encoder_out.size(1))), 0)
+        context_vector = encoder_out.mean(axis=0) # TODO: axis=0 or axis=1 ?
+        # TODO: instead check the following: 1) how is EOS encoded? 2) does EOS always need to be [1, ...., 1]?
+        #nodes = torch.cat((encoder_out, torch.ones(1, encoder_out.size(1))), 0)
+        nodes = encoder_out
         coverage = torch.zeros(len(nodes), 1)
+        att_ws = []
         # Decoder
-        for l in range(len(labels)):
-
+        for l in range(self.max_kp):
+            # Choosing keyphrases in this loop
             if l == 0:
                 # First input token is always <BOS> (BegginingOfString)
-                input_token = torch.zeros((1, 1, self.decoder.embed_size))
-                hidden = torch.tanh(self.h_W(context_vector)).unsqueeze(0).unsqueeze(0)
+                input_token = torch.zeros((batch_size, 1, self.decoder.embed_size))
+                hidden = (torch.tanh(self.h_W(context_vector))
+                          .expand(batch_size, self.hsize).unsqueeze(1))
             else:
-                ids = list(chain.from_iterable(keyphrases))
-                kp = nodes[ids, :].mean(axis=0)
-
-                cy = (context_vector * kp)
+                # keyphrases: [
+                #        [[0, 1, 1, 1, 1, 1, 1],
+                #         [5, 6,1 , 1, 1, ...]],
+                #        [[6, 1, 1, 1, 1, 1, 1],
+                #         [11, 11, 1 , 1, 1, ...]],
+                #       ...
+                # ]
+                #ids = [list(set(chain.from_iterable(i.tolist()))) for i in keyphrases]
+                #kp_mean = (torch.stack([nodes[i][j, :].mean(axis=0)
+                #           for i, j in zip(range(len(nodes)), ids)])
+                #           .unsqueeze(1))
+                ids = list(set(chain.from_iterable(keyphrases)))
+                kp_mean = nodes[ids, :].mean(axis=0)
+                cy = (context_vector * kp_mean) # TODO: concatenate them instead?
+                # TODO: shouldnt an input token be the one RNN outputted?
                 input_token = self.y_W(cy).unsqueeze(0).unsqueeze(0)
                 hidden = torch.tanh(self.h_W(cy)).unsqueeze(0).unsqueeze(0)
 
             keyphrases.append([])
-            # Passing each word through decoder in order to predict (point) the next one
-            for i in range(len(labels[l])):
 
+            # Passing each word through decoder in order to predict (point) the next one
+            while True:
+                # Choosing words of keyphrases in this loop
                 att_w, hidden, word_id = self.decoder(input_token,
                                                       hidden,
                                                       nodes,
                                                       coverage)
-
+                att_ws.append(att_w)
                 if word_id == (len(nodes) - 1):
                     keyphrases[-1].append(word_id)
-                    loss += self.loss(att_w.unsqueeze(0),
-                                      torch.tensor(labels[l][i]))
                     break
                 input_token = nodes[word_id].unsqueeze(0).unsqueeze(0)
                 keyphrases[-1].append(word_id)
                 coverage = coverage.clone()
                 coverage[word_id] += 1
-                # sum the loss up like this
-                # or return predictions and compute the loss for the
-                # whole batch in the training loop?
-                loss += self.loss(att_w.unsqueeze(0),
-                                  torch.tensor(labels[l][i]))
 
-        return keyphrases, loss
+
+        return keyphrases, att_ws
 
 
 class DivGraphEncoder(nn.Module):
@@ -237,7 +248,8 @@ class DivGraphDecoder(torch.nn.Module):
         '''
         # GRU
         rnn_word, rnn_hidden = self.rnn(word_input, word_hidden)
-        rnn_word = rnn_word.squeeze(0)
+        # TODO: shouldnt rnn_word be used as the next input to rnn?
+        #rnn_word = rnn_word.squeeze(0)
         hidden = rnn_hidden.squeeze(0)
         # Attention
         hidden = self.att_W_hidden(hidden).expand(len(nodes), self.hidden_size)
