@@ -81,7 +81,7 @@ def make_kw_labels(keywords, vocab):
             ix = get_kw_index(vocab, word)
             assert ix in range(len(vocab))
             kw_labels.append([ix])
-        kw_labels.append([len(vocab) - 1])
+        kw_labels.append([len(vocab)-1])
         if kw_labels not in labels:
             labels.append(kw_labels)
         else:
@@ -102,7 +102,7 @@ def index_kp(keywords, vocab):
         kp.append(ids)
     return kp
 
-
+# TODO: fix the function which creates labels --> it gets wrong keywords ids sometimes
 def make_DataObject(row):
     vocab, keywords = row['clean'], row['keyword']
     # adding EndOfString token to the vocabulary

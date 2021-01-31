@@ -6,14 +6,15 @@ import torch.optim as optim
 from torch_geometric.data import DataLoader
 from gnn_nlp.DivGraphPointer import DivGraphDecoder, DivGraphEncoder, DivGraphNet
 from gnn_nlp.config import TRAIN_SIZE
+from torch.utils.tensorboard import SummaryWriter
 
-torch.manual_seed(0)
 
-def init_parameters(embed_size, convs, hidden, rnns, opt, tb):
+#torch.manual_seed(0)
+
+def init_parameters(embed_size, convs, hidden, rnns, opt, loss, tb):
     diven = DivGraphEncoder(embed_size, embed_size, convs)
     divdec = DivGraphDecoder(embed_size, hidden, rnns)
-    divnet = DivGraphNet(diven, divdec, tb)
-
+    divnet = DivGraphNet(diven, divdec, loss, tb)
     optimiser = opt(divnet.parameters(), lr=0.01)
     return divnet, optimiser
 
@@ -27,22 +28,16 @@ def split_data(data):
 
     return train_list, valid_list
 
-def pad_nodes(data_list):
-    max_size = max([len(data_list[i].words) for i in range(len(data_list))])
-    for data in data_list:
-        if len(data.x) < max_size:
-            pad = torch.tensor([[-100] * data.x.size(1)] * (max_size - len(data.x)))
-            data.x = torch.cat((data.x, pad), 0)
-    return data_list
 
-def pad_labels(data_list):
-    pass
-
-def prepare_data(data_list):
-
-    data_list = pad_nodes(data_list)
-    array = torch.stack([i.x for i in data_list])
-    return array
+def split_batches(size, data):
+    batches = []
+    ids = list(range(0, len(data), size))
+    for i in range(len(ids)):
+        if i != len(ids) - 1:
+            batches.append(data[ids[i]:ids[i + 1]])
+        else:
+            batches.append(data[ids[i]:])
+    return batches
 
 
 
@@ -50,6 +45,7 @@ def train_divnet(n_epochs, data_list, embed_size,
                  hidden, n_rnn_layers, n_conv_layers,
                  # TODO: attention weights already pass through Softmax in the model,
                  #  maybe use just NLLLoss instead?
+                 batch_size,
                  criterion=nn.CrossEntropyLoss,
                  optimiser=optim.Adam,
                  tensorboard=True):
@@ -73,38 +69,49 @@ def train_divnet(n_epochs, data_list, embed_size,
                                         hidden,
                                         n_rnn_layers,
                                         optimiser,
+                                        criterion,
                                         tensorboard,)
-    criterion = criterion()
     train_list, valid_list = split_data(data_list)
 
-
-    train_loader = DataLoader(train_list, batch_size=1)
-    valid_loader = DataLoader(valid_list, batch_size=1)
+    train_loader = split_batches(batch_size, train_list)
+    valid_loader = split_batches(batch_size, valid_list)
 
     train_losses = {i: [] for i in range(n_epochs)}
     valid_losses = {i: [] for i in range(n_epochs)}
 
     train_kps = []
     valid_kps = []
-    #import pdb;pdb.set_trace()
+    tb_writer = SummaryWriter()
     for epoch in range(n_epochs):
-        optimiser.zero_grad()
+        print('Epoch', epoch)
         divnet.train()
         # TODO: if batch_size > 1, could the model learn to treat a batch as one single sequence?
         #  could it make the training less effective or not?
         for batch in train_loader:
-            preds, attent_w = divnet(batch)
-            # TODO: reshape preds, pad batch.labels if necessary
-            loss = criterion(attent_w, batch.labels)
+            optimiser.zero_grad()
+            preds, loss = divnet(batch)
+            #import pdb;pdb.set_trace()
             loss.backward()
             optimiser.step()
             train_losses[epoch].append(loss.item())
             train_kps.append((batch, preds))
 
+        param_dict = dict(divnet.named_parameters())
+        for name in param_dict.keys():
+            tb_writer.add_histogram(name.upper(),
+                                    param_dict[name],
+                                    epoch)
+            if param_dict[name].grad != None:
+                tb_writer.add_histogram(name.upper() + '  GRAD',
+                                        param_dict[name].grad,
+                                        epoch)
+            else:
+                print('PARAMETER', name, ' is NONE in epoch', epoch)
+
         with torch.no_grad():
             divnet.eval()
             for valid_batch in valid_loader:
-                valid_kp, valid_loss = divnet(valid_batch, valid_batch.labels)
+                valid_kp, valid_loss = divnet(valid_batch)
                 valid_losses[epoch].append(valid_loss.item())
                 valid_kps.append((valid_batch, valid_kp))
 
@@ -115,10 +122,11 @@ if __name__ == '__main__':
 
     import torch
 
-    data = torch.load('../data/small_kpdfDataList.pt')
+    data = torch.load('../data/kp5DataList29-01-21.pt')
     train_kps, train_losses, valid_kps, valid_losses = train_divnet(n_epochs=3,
                                                                     data_list=data[:5],
                                                                     embed_size=100,
                                                                     hidden=300,
                                                                     n_rnn_layers=1,
-                                                                    n_conv_layers=1,)
+                                                                    n_conv_layers=1,
+                                                                    batch_size=2)

@@ -1,19 +1,8 @@
-import os
-import time
-from datetime import datetime
-import re
-import string
-from itertools import chain
-import numpy as np
-import pandas as pd
-from matplotlib import pyplot as plt
-from sklearn.feature_extraction.text import CountVectorizer
-import seaborn as sns
-import networkx as nx
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+
 import torch_geometric.nn as pyg_nn
 import torch_geometric.utils as pyg_utils
 
@@ -73,6 +62,8 @@ class GCNWeightedConv(MessagePassing):
 class GCNWeightedConvM(MessagePassing):
     def __init__(self, in_channels, out_channels):
         super(GCNWeightedConvM, self).__init__(aggr='add')
+        self.lin_left = torch.nn.Linear(in_channels, out_channels)
+        self.lin_right = torch.nn.Linear(in_channels, out_channels)
         self.lin = torch.nn.Linear(in_channels, out_channels)
 
     def forward(self, X, A_left_tilda, A_right_tilda):
@@ -101,8 +92,8 @@ class GCNWeightedConvM(MessagePassing):
         return activation
 
     def propagate(self, X, A_left, A_right):
-        left = self.lin(A_left.float() @ X.float())
-        right = self.lin(A_right.float() @ X.float())
+        left = self.lin_left(A_left.float() @ X.float())
+        right = self.lin_right(A_right.float() @ X.float())
         linear = self.lin(X)
 
         return left + right + linear
@@ -113,76 +104,115 @@ class DivGraphNet(torch.nn.Module):
     Implementation of DivGraphPointer from https://arxiv.org/abs/1905.07689
     '''
 
-    def __init__(self, encoder, decoder, tensorboard=True, max_kp=5):
+    def __init__(self, encoder, decoder, loss, tensorboard=True, max_kp=5):
         super(DivGraphNet, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.loss = loss()
         self.hsize = self.decoder.hidden_size
         self.esize = self.decoder.embed_size
         self.y_W = nn.Linear(self.esize, self.esize)
         self.h_W = nn.Linear(self.esize, self.hsize)
-        self.tb = tensorboard
+        if tensorboard:
+            self.tb = SummaryWriter()
         self.max_kp = max_kp
 
-    def forward(self, batch):
+    def get_labels(self, batch, kp, word):
+        labels = [x.labels for x in batch]
+        target = []
+        for i in range(len(labels)):
+            if (kp < len(labels[i])):
+                if (word < len(labels[i][kp])):
+                    target.append(labels[i][kp][word])
+                else:
+                    #target.append(batch[i].x.size(0)-1) # TODO: append -100 instead?
+                    target.append(-100)
+            else:
+                target.append(-100)
+        return torch.tensor(target)
 
-        batch_size = batch.x.size(0) if len(batch.x.shape) == 3 else 1
+
+    def forward(self, batch, test=False):
+
+        batch_size = len(batch)
         keyphrases = []
+        used_words = {i: set() for i in range(batch_size)}
+        last_ids = torch.tensor([[len(i.words)-1] for i in batch])
         # Encoder
-        encoder_out = self.encoder(batch)
-        context_vector = encoder_out.mean(axis=0) # TODO: axis=0 or axis=1 ?
+        nodes = self.encoder(batch)
+        context_vectors = nodes.mean(axis=1) # TODO: mean through rows or columns ?
         # TODO: instead check the following: 1) how is EOS encoded? 2) does EOS always need to be [1, ...., 1]?
         #nodes = torch.cat((encoder_out, torch.ones(1, encoder_out.size(1))), 0)
-        nodes = encoder_out
-        coverage = torch.zeros(len(nodes), 1)
-        att_ws = []
+        coverages = torch.zeros(batch_size, nodes.size(1), 1)
+        #att_ws = []
         # Decoder
+        loss = 0
         for l in range(self.max_kp):
+            #print('##############################################################################')
+            #print('Generating keyphrase', l)
             # Choosing keyphrases in this loop
             if l == 0:
                 # First input token is always <BOS> (BegginingOfString)
-                input_token = torch.zeros((batch_size, 1, self.decoder.embed_size))
-                hidden = (torch.tanh(self.h_W(context_vector))
-                          .expand(batch_size, self.hsize).unsqueeze(1))
+                input_tokens = torch.zeros((batch_size, 1, self.decoder.embed_size))
+                # TODO: this reshaping only works if number of rnn layers multiplied
+                #  with number of directions equals 1. To experiment with more layers
+                #   or directions, 2d hidden state should be created carefully. In the
+                #  paper it's not described how to do that
+                hiddens = (torch.tanh(self.h_W(context_vectors))
+                          .expand(batch_size, self.hsize).unsqueeze(0))
             else:
-                # keyphrases: [
-                #        [[0, 1, 1, 1, 1, 1, 1],
-                #         [5, 6,1 , 1, 1, ...]],
-                #        [[6, 1, 1, 1, 1, 1, 1],
-                #         [11, 11, 1 , 1, 1, ...]],
-                #       ...
-                # ]
-                #ids = [list(set(chain.from_iterable(i.tolist()))) for i in keyphrases]
-                #kp_mean = (torch.stack([nodes[i][j, :].mean(axis=0)
-                #           for i, j in zip(range(len(nodes)), ids)])
-                #           .unsqueeze(1))
-                ids = list(set(chain.from_iterable(keyphrases)))
-                kp_mean = nodes[ids, :].mean(axis=0)
-                cy = (context_vector * kp_mean) # TODO: concatenate them instead?
+                #nodes[torch.arange(batch_size).unsqueeze(-1), keyphrases[-1]].mean(axis=1)
+
+                #ids = [list(set(chain.from_iterable(i))) for i in keyphrases]
+                kp_mean = (torch.stack([nodes[i][list(used_words[i]), :].mean(axis=0)
+                           for i in range(batch_size)]))
+                cy = (context_vectors * kp_mean) # TODO: concatenate them instead?
                 # TODO: shouldnt an input token be the one RNN outputted?
-                input_token = self.y_W(cy).unsqueeze(0).unsqueeze(0)
-                hidden = torch.tanh(self.h_W(cy)).unsqueeze(0).unsqueeze(0)
-
-            keyphrases.append([])
-
+                input_tokens = self.y_W(cy).reshape((batch_size, 1, nodes.size(2))) # shape (batch, 1, embed)
+                hiddens = torch.tanh(self.h_W(cy)).unsqueeze(0)
+            n_words = 0
+            eos = torch.tensor([[False]]*batch_size)
             # Passing each word through decoder in order to predict (point) the next one
             while True:
+                #print('Picking words for the phrase', l)
+                #print('Number of words', n_words)
                 # Choosing words of keyphrases in this loop
-                att_w, hidden, word_id = self.decoder(input_token,
-                                                      hidden,
+                att_w, hidden, word_id = self.decoder(input_tokens,
+                                                      hiddens,
                                                       nodes,
-                                                      coverage)
-                att_ws.append(att_w)
-                if word_id == (len(nodes) - 1):
-                    keyphrases[-1].append(word_id)
+                                                      coverages)
+                #param_dict = dict(self.named_parameters())
+                self.tb.add_histogram('ATTENTION',
+                                      att_w,
+                                      n_words)
+
+                for i in range(batch_size):
+                    used_words[i].add(word_id[i].item())
+                if n_words == 0:
+                    kp = word_id
+                else:
+                    kp = torch.cat((kp, word_id), dim=1)
+                # TODO: LOSS:
+                #  - for each word? each keyphrase? sum them up?
+                if not test:
+                    target = self.get_labels(batch, l, n_words)
+                    loss += self.loss(att_w, target)
+                n_words += 1
+                    #words_att.append(att_w)
+                eos = (eos | (word_id == last_ids))
+                if (sum(eos).item() == batch_size) or (n_words > 10):
+                    kp = torch.cat((kp, word_id), dim=1)
+                    #att_ws.append(att_w)
+                    # TODO: return loss as well
                     break
-                input_token = nodes[word_id].unsqueeze(0).unsqueeze(0)
-                keyphrases[-1].append(word_id)
-                coverage = coverage.clone()
-                coverage[word_id] += 1
+                slice = torch.arange(batch_size).unsqueeze(-1)
+                input_tokens = nodes[slice, word_id]
+                coverages = coverages.clone()
+                coverages[slice, word_id] += 1
+            keyphrases.append(kp)
 
 
-        return keyphrases, att_ws
+        return keyphrases, loss
 
 
 class DivGraphEncoder(nn.Module):
@@ -197,18 +227,36 @@ class DivGraphEncoder(nn.Module):
         for i in range(num_convs - 1):
             self.convs.append(GCNWeightedConvM(hidden_dim, hidden_dim))
 
-    def forward(self, data_obj):
-        '''Passing the data with its matrices through the conv layer GCNWeightedConvM'''
-        x, a_left, a_right = data_obj.x, data_obj.a_left, data_obj.a_right
 
-        for i in range(len(self.convs)):
-            x = self.convs[i](x, a_left, a_right)
-            # embedding = x
-            # x = F.relu(x)
-            # x = F.dropout(x, p=self.dropout, training=self.training)
-            # if not i == self.num_layers - 1:
-            #    x = self.lns[i](x)
-        return x
+    def pad_arrays(self, tensors):
+        max_size = len(max(tensors, key=len))
+        padded = []
+        for data in tensors:
+            if len(data) < max_size:
+                pad = torch.tensor([[-100] * data.size(1)] * (max_size - len(data)))
+                data = torch.cat((data, pad), 0)
+            padded.append(data)
+        return padded
+
+    def forward(self, batch):
+        '''Passing the data with its matrices through the conv layer GCNWeightedConvM'''
+        arrays = []
+        for object in batch:
+            x, a_left, a_right = object.x, object.a_left, object.a_right
+
+            for i in range(len(self.convs)):
+                x = self.convs[i](x, a_left, a_right)
+                # TODO: Add DropOut and activation if there is more than 1 conv
+                # x = F.relu(x)
+                # x = F.dropout(x, p=self.dropout, training=self.training)
+            arrays.append(x)
+        shapes = {len(a) for a in arrays}
+        # if not all the tensors in the *arrays* have the same shape...
+        if len(shapes) > 1:
+            # ...pad them
+            arrays = self.pad_arrays(arrays)
+
+        return torch.stack(arrays)
 
 
 class DivGraphDecoder(torch.nn.Module):
@@ -250,12 +298,14 @@ class DivGraphDecoder(torch.nn.Module):
         rnn_word, rnn_hidden = self.rnn(word_input, word_hidden)
         # TODO: shouldnt rnn_word be used as the next input to rnn?
         #rnn_word = rnn_word.squeeze(0)
-        hidden = rnn_hidden.squeeze(0)
+        #print('RNN HIDDEN', rnn_hidden)
+        hidden = (rnn_hidden.reshape((word_input.size(0), 1, self.hidden_size))
+                  .expand(word_input.size(0), nodes.size(1), self.hidden_size))
         # Attention
-        hidden = self.att_W_hidden(hidden).expand(len(nodes), self.hidden_size)
-        term = hidden + self.att_W_input(nodes) + self.att_W_coverage(coverage)
-        att_coef = self.att_v(torch.tanh(term)).squeeze(1)
-        norm_att = F.softmax(att_coef, dim=0)
-        next_word_id = norm_att.argmax().item()
+        term = self.att_W_hidden(hidden) + self.att_W_input(nodes) + self.att_W_coverage(coverage)
+        att_coef = self.att_v(torch.tanh(term))
+        norm_att = F.softmax(att_coef, dim=1)
+        #print('AFTER SOFTMAX', norm_att)
+        next_word_id = norm_att.argmax(axis=1)
 
-        return norm_att, rnn_hidden, next_word_id
+        return norm_att.squeeze(2), rnn_hidden, next_word_id
