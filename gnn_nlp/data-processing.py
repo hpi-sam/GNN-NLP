@@ -117,6 +117,8 @@ def make_DataObject(row):
     data.a_left = Aleft_tilda
     data.a_right = Aright_tilda
     data.words = columns
+    # labels = [[0, 8],
+    #           [3, 4, 8]]
     labels = make_kw_labels(keywords, vocab)
     data.labels = labels
     data.kp = index_kp(keywords, vocab)

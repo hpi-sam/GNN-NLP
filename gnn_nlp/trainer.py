@@ -11,11 +11,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 #torch.manual_seed(0)
 
-def init_parameters(embed_size, convs, hidden, rnns, opt, loss, tb):
+def init_parameters(embed_size, convs, hidden, rnns, opt, loss, tb, lr):
     diven = DivGraphEncoder(embed_size, embed_size, convs)
     divdec = DivGraphDecoder(embed_size, hidden, rnns)
     divnet = DivGraphNet(diven, divdec, loss, tb)
-    optimiser = opt(divnet.parameters(), lr=0.01)
+    optimiser = opt(divnet.parameters(), lr=lr)
     return divnet, optimiser
 
 def split_data(data):
@@ -48,7 +48,10 @@ def train_divnet(n_epochs, data_list, embed_size,
                  batch_size,
                  criterion=nn.CrossEntropyLoss,
                  optimiser=optim.Adam,
-                 tensorboard=True):
+                 tensorboard=True,
+                 tb_text='',
+                 lr=2e-4,
+                 tb_folder='runs'):
     '''
 
     :param n_epochs: int, number of epochs to train
@@ -70,7 +73,9 @@ def train_divnet(n_epochs, data_list, embed_size,
                                         n_rnn_layers,
                                         optimiser,
                                         criterion,
-                                        tensorboard,)
+                                        tensorboard,
+                                        lr=lr,
+                                        )
     train_list, valid_list = split_data(data_list)
 
     train_loader = split_batches(batch_size, train_list)
@@ -81,7 +86,9 @@ def train_divnet(n_epochs, data_list, embed_size,
 
     train_kps = []
     valid_kps = []
-    tb_writer = SummaryWriter()
+    tb_writer = SummaryWriter(log_dir=tb_folder)
+    if tb_text:
+        tb_writer.add_text('divnet', tb_text)
     for epoch in range(n_epochs):
         print('Epoch', epoch)
         divnet.train()
@@ -96,17 +103,16 @@ def train_divnet(n_epochs, data_list, embed_size,
             train_losses[epoch].append(loss.item())
             train_kps.append((batch, preds))
 
-        param_dict = dict(divnet.named_parameters())
-        for name in param_dict.keys():
-            tb_writer.add_histogram(name.upper(),
-                                    param_dict[name],
-                                    epoch)
-            if param_dict[name].grad != None:
-                tb_writer.add_histogram(name.upper() + '  GRAD',
-                                        param_dict[name].grad,
-                                        epoch)
-            else:
-                print('PARAMETER', name, ' is NONE in epoch', epoch)
+        #param_dict = dict(divnet.named_parameters())
+        #for name in param_dict.keys():
+        #    tb_writer.add_histogram(name.upper(),
+        #                            param_dict[name],
+        #                            epoch)
+        #    if epoch != 0:
+        #        tb_writer.add_histogram(name.upper() + '  GRAD',
+        #                                param_dict[name].grad,
+        #                                epoch)
+
 
         with torch.no_grad():
             divnet.eval()
@@ -114,7 +120,7 @@ def train_divnet(n_epochs, data_list, embed_size,
                 valid_kp, valid_loss = divnet(valid_batch)
                 valid_losses[epoch].append(valid_loss.item())
                 valid_kps.append((valid_batch, valid_kp))
-
+    tb_writer.close()
     return train_kps, train_losses, valid_kps, valid_losses
 
 

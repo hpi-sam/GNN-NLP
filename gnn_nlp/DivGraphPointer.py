@@ -3,19 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-import torch_geometric.nn as pyg_nn
-import torch_geometric.utils as pyg_utils
-
-
-from torch_geometric.datasets import TUDataset
-from torch_geometric.datasets import Planetoid
-from torch_geometric.data import Data
-from torch_geometric.data import InMemoryDataset
-from torch_geometric.data import Dataset
-import torch_geometric.transforms as T
-from torch_geometric import utils
 from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import add_self_loops, degree
 
 
 class GCNWeightedConv(MessagePassing):
@@ -77,6 +65,8 @@ class GCNWeightedConvM(MessagePassing):
         :param A_right_tilda:
         :return:
         '''
+        # TODO: add noise to A---tilda matrices, experiment what differences the amount of
+        #  noise makes (e.g. add more noise to A_left, less A_right or viceversa) ?
         D_right = torch.diag_embed(A_right_tilda.sum(dim=1).pow(-0.5))
         D_left = torch.diag_embed(A_left_tilda.sum(dim=1).pow(-0.5))
 
@@ -84,11 +74,13 @@ class GCNWeightedConvM(MessagePassing):
         A_right_hat = D_right @ A_right_tilda
 
         f = self.propagate(X, A_left_hat, A_right_hat)
+        # TODO: try Relu instead of sigmoid
         g = torch.sigmoid(f)
 
         activation = (f * g)
         if X.size() == activation.size():
             return X + activation
+
         return activation
 
     def propagate(self, X, A_left, A_right):
@@ -113,8 +105,9 @@ class DivGraphNet(torch.nn.Module):
         self.esize = self.decoder.embed_size
         self.y_W = nn.Linear(self.esize, self.esize)
         self.h_W = nn.Linear(self.esize, self.hsize)
+        self.lrelu = nn.ReLU()
         if tensorboard:
-            self.tb = SummaryWriter()
+            self.tb = SummaryWriter(log_dir='runs/ATT_VvsCY/')
         self.max_kp = max_kp
 
     def get_labels(self, batch, kp, word):
@@ -125,8 +118,8 @@ class DivGraphNet(torch.nn.Module):
                 if (word < len(labels[i][kp])):
                     target.append(labels[i][kp][word])
                 else:
-                    #target.append(batch[i].x.size(0)-1) # TODO: append -100 instead?
-                    target.append(-100)
+                    target.append(batch[i].x.size(0)-1) # TODO: append -100 instead?
+                    #target.append(-100)
             else:
                 target.append(-100)
         return torch.tensor(target)
@@ -140,6 +133,8 @@ class DivGraphNet(torch.nn.Module):
         last_ids = torch.tensor([[len(i.words)-1] for i in batch])
         # Encoder
         nodes = self.encoder(batch)
+        # nodes shape: (8, 100)
+
         context_vectors = nodes.mean(axis=1) # TODO: mean through rows or columns ?
         # TODO: instead check the following: 1) how is EOS encoded? 2) does EOS always need to be [1, ...., 1]?
         #nodes = torch.cat((encoder_out, torch.ones(1, encoder_out.size(1))), 0)
@@ -153,13 +148,14 @@ class DivGraphNet(torch.nn.Module):
             # Choosing keyphrases in this loop
             if l == 0:
                 # First input token is always <BOS> (BegginingOfString)
-                input_tokens = torch.zeros((batch_size, 1, self.decoder.embed_size))
+                input_tokens = torch.zeros((batch_size, 1, self.decoder.embed_size)) # (4, 1, 100)
                 # TODO: this reshaping only works if number of rnn layers multiplied
                 #  with number of directions equals 1. To experiment with more layers
                 #   or directions, 2d hidden state should be created carefully. In the
                 #  paper it's not described how to do that
-                hiddens = (torch.tanh(self.h_W(context_vectors))
-                          .expand(batch_size, self.hsize).unsqueeze(0))
+
+                hiddens = (self.h_W(context_vectors)
+                          .expand(batch_size, self.hsize).unsqueeze(0)) # (num_layers*num_dirs, batch, 100)
             else:
                 #nodes[torch.arange(batch_size).unsqueeze(-1), keyphrases[-1]].mean(axis=1)
 
@@ -168,8 +164,9 @@ class DivGraphNet(torch.nn.Module):
                            for i in range(batch_size)]))
                 cy = (context_vectors * kp_mean) # TODO: concatenate them instead?
                 # TODO: shouldnt an input token be the one RNN outputted?
+                '''Added LReLu'''
                 input_tokens = self.y_W(cy).reshape((batch_size, 1, nodes.size(2))) # shape (batch, 1, embed)
-                hiddens = torch.tanh(self.h_W(cy)).unsqueeze(0)
+                hiddens = self.h_W(cy).unsqueeze(0)
             n_words = 0
             eos = torch.tensor([[False]]*batch_size)
             # Passing each word through decoder in order to predict (point) the next one
@@ -177,14 +174,18 @@ class DivGraphNet(torch.nn.Module):
                 #print('Picking words for the phrase', l)
                 #print('Number of words', n_words)
                 # Choosing words of keyphrases in this loop
-                att_w, hidden, word_id = self.decoder(input_tokens,
-                                                      hiddens,
-                                                      nodes,
-                                                      coverages)
+                att_w, hidden, word_id, term = self.decoder(input_tokens,
+                                                          hiddens,
+                                                          nodes,
+                                                          coverages)
+                self.tb.add_histogram('ATT_V TERM', term, l)
+                if l != 0:
+                    self.tb.add_histogram('cY', cy, l)
+
                 #param_dict = dict(self.named_parameters())
-                self.tb.add_histogram('ATTENTION',
-                                      att_w,
-                                      n_words)
+                #self.tb.add_histogram('ATTENTION',
+                #                      att_w,
+                #                      n_words)
 
                 for i in range(batch_size):
                     used_words[i].add(word_id[i].item())
@@ -192,12 +193,14 @@ class DivGraphNet(torch.nn.Module):
                     kp = word_id
                 else:
                     kp = torch.cat((kp, word_id), dim=1)
+
                 # TODO: LOSS:
                 #  - for each word? each keyphrase? sum them up?
                 if not test:
                     target = self.get_labels(batch, l, n_words)
                     loss += self.loss(att_w, target)
                 n_words += 1
+
                     #words_att.append(att_w)
                 eos = (eos | (word_id == last_ids))
                 if (sum(eos).item() == batch_size) or (n_words > 10):
@@ -205,6 +208,7 @@ class DivGraphNet(torch.nn.Module):
                     #att_ws.append(att_w)
                     # TODO: return loss as well
                     break
+
                 slice = torch.arange(batch_size).unsqueeze(-1)
                 input_tokens = nodes[slice, word_id]
                 coverages = coverages.clone()
@@ -221,8 +225,10 @@ class DivGraphEncoder(nn.Module):
         super(DivGraphEncoder, self).__init__()
 
         self.num_convs = num_convs
-        self.linear = nn.Linear(input_dim, hidden_dim)
+        #self.linear = nn.Linear(input_dim, hidden_dim)
         self.convs = nn.ModuleList()
+        self.drop = nn.Dropout(0.5)
+        self.relu = nn.ReLU()
         self.convs.append(GCNWeightedConvM(input_dim, hidden_dim))
         for i in range(num_convs - 1):
             self.convs.append(GCNWeightedConvM(hidden_dim, hidden_dim))
@@ -238,7 +244,7 @@ class DivGraphEncoder(nn.Module):
             padded.append(data)
         return padded
 
-    def forward(self, batch):
+    def forward(self, batch): # [Data(x=(8, 100), labels=2, words=8), Data(x=(15, 100), labels=5)]
         '''Passing the data with its matrices through the conv layer GCNWeightedConvM'''
         arrays = []
         for object in batch:
@@ -246,6 +252,7 @@ class DivGraphEncoder(nn.Module):
 
             for i in range(len(self.convs)):
                 x = self.convs[i](x, a_left, a_right)
+                x = self.drop(x)
                 # TODO: Add DropOut and activation if there is more than 1 conv
                 # x = F.relu(x)
                 # x = F.dropout(x, p=self.dropout, training=self.training)
@@ -256,7 +263,7 @@ class DivGraphEncoder(nn.Module):
             # ...pad them
             arrays = self.pad_arrays(arrays)
 
-        return torch.stack(arrays)
+        return torch.stack(arrays) # (batch, long_article, gcnConvOutputDim)
 
 
 class DivGraphDecoder(torch.nn.Module):
@@ -274,13 +281,20 @@ class DivGraphDecoder(torch.nn.Module):
             rnn_layers,
             bidirectional=bi,
             batch_first=batch_first,
+            #dropout=0.5,
         )
+        self.lrelu = nn.ReLU()
         self.embed_size = embed_size
         self.hidden_size = hidden_size
-        self.att_v = nn.Linear(hidden_size, 1, bias=False)
-        self.att_W_hidden = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.att_W_input = nn.Linear(embed_size, hidden_size, bias=False)
-        self.att_W_coverage = nn.Linear(1, hidden_size)
+        # TODO: what's so special about att_v?
+        self.att_v = nn.Sequential(nn.Linear(hidden_size, 1),
+                                   nn.Dropout(0.5))
+        self.att_W_hidden = nn.Sequential(nn.Linear(hidden_size, hidden_size),
+                                          nn.Dropout(0.5))
+        self.att_W_input = nn.Sequential(nn.Linear(embed_size, hidden_size),
+                                         nn.Dropout(0.5))
+        self.att_W_coverage = nn.Sequential(nn.Linear(1, hidden_size),
+                                            nn.Dropout(0.5))
         self.bi = 2 if bi else 1
         self.rnn_layers = rnn_layers
 
@@ -295,12 +309,16 @@ class DivGraphDecoder(torch.nn.Module):
         :return:
         '''
         # GRU
-        rnn_word, rnn_hidden = self.rnn(word_input, word_hidden)
+        # TODO: vanishing gradients are sensitive to the batch size:
+        #  1) the larger the batch size --> more van. grads
+        #  2) try training with different batch sizes (e.g. batches with diff % of stopwords)
+        #  '''Reasons: sparsity, stopwords?'''
+        rnn_word, rnn_hidden = self.rnn(word_input, word_hidden) #BOS
         # TODO: shouldnt rnn_word be used as the next input to rnn?
         #rnn_word = rnn_word.squeeze(0)
         #print('RNN HIDDEN', rnn_hidden)
-        hidden = (rnn_hidden.reshape((word_input.size(0), 1, self.hidden_size))
-                  .expand(word_input.size(0), nodes.size(1), self.hidden_size))
+        hidden = self.lrelu((rnn_hidden.reshape((word_input.size(0), 1, self.hidden_size))
+                  .expand(word_input.size(0), nodes.size(1), self.hidden_size)))
         # Attention
         term = self.att_W_hidden(hidden) + self.att_W_input(nodes) + self.att_W_coverage(coverage)
         att_coef = self.att_v(torch.tanh(term))
@@ -308,4 +326,5 @@ class DivGraphDecoder(torch.nn.Module):
         #print('AFTER SOFTMAX', norm_att)
         next_word_id = norm_att.argmax(axis=1)
 
-        return norm_att.squeeze(2), rnn_hidden, next_word_id
+
+        return norm_att.squeeze(2), rnn_hidden, next_word_id, torch.tanh(term)
